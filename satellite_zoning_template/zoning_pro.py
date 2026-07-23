@@ -55,13 +55,17 @@ FARM         = "ГЕВОРГ"
 FIELD_NAME   = "P4"
 BOUNDARY_SRC = None            # shp контуру поля АБО будь-який NDVI-shp поля (для меж)
 OUT_ROOT     = "output_pro"
-N_ZONES      = 5
+ZONES_MIN    = 3               # автопідбір кількості зон у цьому діапазоні
+ZONES_MAX    = 6               # (силует): скільки РЕАЛЬНИХ зон, стільки й робимо
 SMOOTH_LEVEL = "C"
 YEARS        = range(2019, 2025)
-MONTHS       = (6, 8)          # вікно піку вегетації (міс. від/до, включно)
-MAX_PER_YEAR = 3               # найменш хмарних сцен на рік
+MONTHS       = (6, 8)          # вікно піку вегетації (вегетація)
+SOIL_MONTHS  = (3, 4)          # ранньовесняний голий ґрунт (після сходу снігу)
+MAX_PER_YEAR = 3               # найменш хмарних сцен на рік (кожне вікно)
 CLOUD_MAX    = 25              # % хмарності сцени
-CANOPY_NDVI  = 0.40            # медіана NDVI сцени > -> сцена канопі (інакше голий ґрунт)
+CANOPY_NDVI  = 0.40            # медіана NDVI > -> канопі-сцена (вегетація)
+SOIL_NDVI    = 0.30            # медіана NDVI < -> сцена голого ґрунту
+USE_RELIEF_FEATURE = True      # враховувати рельєф як фактор кластеризації
 GRID_M       = 10.0            # Sentinel-2 native
 EDGE_BUFFER_M = 18.0
 POINT_STEP_M = 20
@@ -91,11 +95,11 @@ def field_boundary(src, epsg=None):
 
 
 # --------------------------------------------------------------- Sentinel-2
-def stac_scenes(bwgs):
+def stac_scenes(bwgs, months):
     feats = []
     for y in YEARS:
         body = json.dumps({"collections": ["sentinel-2-l2a"], "bbox": list(bwgs),
-                           "datetime": f"{y}-{MONTHS[0]:02d}-05T00:00:00Z/{y}-{MONTHS[1]:02d}-28T00:00:00Z",
+                           "datetime": f"{y}-{months[0]:02d}-01T00:00:00Z/{y}-{months[1]:02d}-28T00:00:00Z",
                            "query": {"eo:cloud_cover": {"lt": CLOUD_MAX}}, "limit": 40}).encode()
         req = urllib.request.Request(STAC, data=body, headers={"Content-Type": "application/json"})
         r = json.load(urllib.request.urlopen(req, context=CTX, timeout=60))
@@ -120,10 +124,10 @@ def read_band(url, bwgs, epsg, ttr, H, W):
     return out
 
 
-def fetch_composites(bwgs, epsg, ttr, H, W):
-    feats = stac_scenes(bwgs)
-    print(f"  candidate S2 scenes (<= {MAX_PER_YEAR}/yr, cloud<{CLOUD_MAX}%): {len(feats)}")
-    NDVI, NDRE, NDMI, used, rgb = [], [], [], [], None
+def fetch_veg(bwgs, epsg, ttr, H, W):
+    """Peak-season canopy: median NDVI / NDRE (vigour) + NDMI (canopy water)."""
+    feats = stac_scenes(bwgs, MONTHS)
+    NDVI, NDRE, NDMI, used = [], [], [], []
     for ft in feats:
         a = ft["assets"]; date = ft["properties"]["datetime"][:10]
         try:
@@ -139,64 +143,109 @@ def fetch_composites(bwgs, epsg, ttr, H, W):
             continue
         red /= 1e4; nir /= 1e4; re1 /= 1e4; sw1 /= 1e4
         ndvi = np.where(good, (nir - red) / (nir + red + 1e-6), np.nan)
-        if np.nanmedian(ndvi) < CANOPY_NDVI:
+        if np.nanmedian(ndvi) < CANOPY_NDVI:     # skip bare-soil dates here
             continue
         NDVI.append(ndvi)
         NDRE.append(np.where(good, (nir - re1) / (nir + re1 + 1e-6), np.nan))
         NDMI.append(np.where(good, (nir - sw1) / (nir + sw1 + 1e-6), np.nan))
         used.append(date)
-        if rgb is None:                          # true-colour from 1st good scene
-            try:
-                g = read_band(a["green"]["href"], bwgs, epsg, ttr, H, W) / 1e4
-                b = read_band(a["blue"]["href"], bwgs, epsg, ttr, H, W) / 1e4
-                rgb = np.dstack([np.clip(red / 0.3, 0, 1), np.clip(g / 0.3, 0, 1),
-                                 np.clip(b / 0.3, 0, 1)])
-            except Exception:
-                pass
     if len(used) < 2:
         raise SystemExit(f"Замало канопі-сцен ({len(used)}) — розширте YEARS/MONTHS.")
-    comp = dict(ndvi=np.nanmedian(np.stack(NDVI), 0),
-                ndre=np.nanmedian(np.stack(NDRE), 0),
-                ndmi=np.nanmedian(np.stack(NDMI), 0))
-    print(f"  USED canopy scenes: {len(used)} ({min(used)}..{max(used)})")
-    return comp, sorted(used), rgb
+    print(f"  canopy scenes: {len(used)} ({min(used)}..{max(used)})")
+    return (np.nanmedian(np.stack(NDVI), 0), np.nanmedian(np.stack(NDRE), 0),
+            np.nanmedian(np.stack(NDMI), 0), sorted(used))
+
+
+def fetch_soil(bwgs, epsg, ttr, H, W):
+    """Post-snowmelt BARE SOIL (early spring, no snow, no canopy): soil brightness
+    (OM / darkness) + soil moisture (NSMI). Reveals where soil holds water better.
+    Returns (brightness, moisture, used) or (None, None, []) if no bare-soil scenes."""
+    feats = stac_scenes(bwgs, SOIL_MONTHS)
+    BRIGHT, MOIST, used = [], [], []
+    for ft in feats:
+        a = ft["assets"]; date = ft["properties"]["datetime"][:10]
+        try:
+            scl = read_band(a["scl"]["href"], bwgs, epsg, ttr, H, W)
+            blue = read_band(a["blue"]["href"], bwgs, epsg, ttr, H, W)
+            green = read_band(a["green"]["href"], bwgs, epsg, ttr, H, W)
+            red = read_band(a["red"]["href"], bwgs, epsg, ttr, H, W)
+            nir = read_band(a["nir"]["href"], bwgs, epsg, ttr, H, W)
+            sw1 = read_band(a["swir16"]["href"], bwgs, epsg, ttr, H, W)
+            sw2 = read_band(a["swir22"]["href"], bwgs, epsg, ttr, H, W)
+        except Exception:
+            continue
+        sclr = np.round(scl)
+        soil = np.isin(sclr, [4, 5, 7])
+        snow = (sclr == 11).mean()
+        if soil.mean() < 0.5 or snow > 0.1:      # need bare, snow-free
+            continue
+        blue/=1e4; green/=1e4; red/=1e4; nir/=1e4; sw1/=1e4; sw2/=1e4
+        ndvi = (nir - red) / (nir + red + 1e-6)
+        if np.nanmedian(np.where(soil, ndvi, np.nan)) > SOIL_NDVI:   # still vegetated -> skip
+            continue
+        bright = np.where(soil, (blue + green + red + nir) / 4, np.nan)   # темніше = більше органіки/вологи
+        moist = np.where(soil, (sw1 - sw2) / (sw1 + sw2 + 1e-6), np.nan)  # NSMI: вище = вологіше
+        BRIGHT.append(bright); MOIST.append(moist); used.append(date)
+    if len(used) == 0:
+        print("  bare-soil scenes: 0 (шар ґрунту пропущено)")
+        return None, None, []
+    print(f"  bare-soil scenes: {len(used)} ({min(used)}..{max(used)})")
+    return np.nanmedian(np.stack(BRIGHT), 0), np.nanmedian(np.stack(MOIST), 0), sorted(used)
+
+
+def auto_k(X, kmin, kmax):
+    """Pick the REAL number of zones by best average silhouette (data-driven)."""
+    from sklearn.metrics import silhouette_score
+    rs = np.random.RandomState(0)
+    samp = X if len(X) <= 5000 else X[rs.choice(len(X), 5000, replace=False)]
+    best_k, best_s, scores = kmin, -1, {}
+    for k in range(kmin, kmax + 1):
+        lab = KMeans(k, n_init=8, random_state=0).fit_predict(samp)
+        s = silhouette_score(samp, lab)
+        scores[k] = round(float(s), 3)
+        if s > best_s + 0.01:      # require a real improvement to add a zone
+            best_s, best_k = s, k
+    print(f"  auto-k silhouette {scores} -> {best_k} зон")
+    return best_k
 
 
 # --------------------------------------------------------------- zoning core
-def zonify(stack_feats, ndvi_c, core_mask, field_mask, field, tr, H, W):
-    """stack_feats: (N,H,W) standardized index composites (core). Returns zones gdf + label raster."""
+def zonify(feat_list, ndvi_c, core_mask, field_mask, field, tr, H, W):
+    """feat_list: list of HxW core-masked feature arrays (veg + soil + relief).
+    Standardize -> PCA -> AUTO-select real number of zones -> cluster -> compact.
+    Returns (zones gdf, full-field label raster, k)."""
+    from sklearn.decomposition import PCA
     P = rz.LEVELS[SMOOTH_LEVEL]
-    cm = core_mask & np.all(~np.isnan(stack_feats), axis=0)
-    X = np.column_stack([f[cm] for f in stack_feats])
+    cm = core_mask & np.all([~np.isnan(f) for f in feat_list], axis=0)
+    sm = [ndi.gaussian_filter(np.where(cm, f, np.nanmean(f[cm])), P["pre"] / GRID_M) for f in feat_list]
+    X = np.column_stack([f[cm] for f in sm])
     Xs = StandardScaler().fit_transform(X)
-    # light spatial smoothing of features for coherence
-    km = KMeans(N_ZONES, n_init=10, random_state=0).fit(Xs)
-    lab = np.zeros((H, W), "int32"); lab[cm] = km.labels_ + 1
-    order = sorted(range(1, N_ZONES + 1), key=lambda c: np.nanmean(ndvi_c[(lab == c) & cm]))
+    Xp = PCA(n_components=0.95, random_state=0).fit_transform(Xs) if Xs.shape[1] > 1 else Xs
+    k = auto_k(Xp, ZONES_MIN, ZONES_MAX)
+    lab = np.zeros((H, W), "int32")
+    lab[cm] = KMeans(k, n_init=10, random_state=0).fit_predict(Xp) + 1
+    order = sorted(range(1, k + 1), key=lambda c: np.nanmean(ndvi_c[(lab == c) & cm]))
     remap = {o: n for n, o in enumerate(order, 1)}
     lab = np.vectorize(lambda x: remap.get(x, 0))(lab).astype("int32"); lab[~cm] = 0
-    # de-hair (compact) via one-hot gaussian argmax
     if P["compact"] > 0:
         prob = np.stack([ndi.gaussian_filter((lab == z).astype("float32"), P["compact"] / GRID_M)
-                         for z in range(1, N_ZONES + 1)])
+                         for z in range(1, k + 1)])
         lab2 = np.zeros((H, W), "int32"); lab2[cm] = (prob.argmax(0) + 1)[cm]
     else:
         lab2 = lab.copy()
     lab2 = rz.sieve(lab2, cm, int(P["min_frac"] * field.area / GRID_M ** 2))
-    # extend to FULL field
     full = rz.nearest_fill(lab2, lab2 > 0)
     full = np.where(field_mask, full, 0).astype("int32")
     if P["round_m"] > 0:
         sig = P["round_m"] / GRID_M
-        prob = np.stack([ndi.gaussian_filter((full == z).astype("float32"), sig) for z in range(1, N_ZONES + 1)])
+        prob = np.stack([ndi.gaussian_filter((full == z).astype("float32"), sig) for z in range(1, k + 1)])
         fulls = np.zeros_like(full); fulls[field_mask] = (prob.argmax(0) + 1)[field_mask]
         fulls = rz.sieve(fulls, field_mask, int(0.3 * 1e4 / GRID_M ** 2))
     else:
         fulls = full
     recs = [{"zone_id": int(v), "geometry": shape(g)}
             for g, v in rio_shapes(fulls, mask=field_mask, transform=tr) if int(v)]
-    z = gpd.GeoDataFrame(recs, crs=field.crs if hasattr(field, "crs") else None)
-    return z, fulls
+    return gpd.GeoDataFrame(recs), fulls, k
 
 
 # --------------------------------------------------------------- report
@@ -205,7 +254,8 @@ def build_pdf(paths, meta, out_pdf):
         f'<figure><img src="data:image/png;base64,{base64.b64encode(open(p,"rb").read()).decode()}"/>'
         f'<figcaption>{cap}</figcaption></figure>' for p, cap in paths)
     rows = "".join(f"<tr><td>{r['zone_id']}</td><td>{r['product']}</td><td>{r['area_ha']}</td>"
-                   f"<td>{r['ndvi']}</td><td>{r['ndre']}</td></tr>" for r in meta["zone_rows"])
+                   f"<td>{r['ndvi']}</td><td>{r['ndre']}</td><td>{r['ndmi']}</td>"
+                   f"<td>{r.get('soil_m', '—')}</td></tr>" for r in meta["zone_rows"])
     html = f"""<!doctype html><html lang="uk"><head><meta charset="utf-8"><style>
 @page {{ size:A4; margin:12mm; }}
 body {{ font-family:'DejaVu Sans',Arial,sans-serif; font-size:9.5pt; color:#1a1a1a; }}
@@ -219,14 +269,16 @@ th,td {{ border:1px solid #bbb; padding:2px 5px; text-align:center; }} th {{ bac
 .box {{ background:#f2f8f3; border-left:4px solid #86c28c; padding:5px 10px; margin:6px 0; font-size:8.5pt; }}
 </style></head><body>
 <h1>Зонування поля {meta['field']} — {meta['farm']}</h1>
-<div class="sub">Площа {meta['area_ha']} га · {meta['zones']} зон · {meta['date']}</div>
-<div class="box"><b>Дані для зонування:</b> Sentinel-2 L2A (ESA/Copernicus, 10&nbsp;м) —
-<b>{meta['n_scenes']} безхмарних сцен</b> за <b>{meta['period']}</b> (пік вегетації, міс. {meta['months']}).
-Індекси: <b>NDVI</b> (вигор), <b>NDRE</b> (червоний край, без насичення), <b>NDMI</b> (волога).
-Рельєф: Copernicus GLO-30. Зони — стабільний багаторічний медіанний композит, кластеризація.</div>
+<div class="sub">Площа {meta['area_ha']} га · {meta['zones']} зон (підібрано автоматично)</div>
+<div class="box"><b>Дані для зонування:</b> Sentinel-2 L2A (ESA/Copernicus, 10&nbsp;м).<br>
+Вегетація: <b>{meta['n_veg']} безхмарних сцен</b> за <b>{meta['period_veg']}</b> (пік, міс. {meta['months_veg']}) —
+<b>NDVI</b> (вигор), <b>NDRE</b> (червоний край), <b>NDMI</b> (волога посіву).<br>
+{meta['soil_line']}<br>
+Рельєф: Copernicus GLO-30. <b>Кількість зон ({meta['autok']}) підібрано автоматично</b> за структурою
+даних (силует) — не форсовано. Метод: багаторічні медіанні композити → PCA → кластеризація.</div>
 <div class="grid">{imgs}</div>
-<table><tr><th>Зона</th><th>Продуктив.<br>(поле=100)</th><th>Площа, га</th><th>NDVI</th><th>NDRE</th></tr>{rows}</table>
-<div class="sub" style="margin-top:6px">Дати сцен: {meta['dates']}</div>
+<table><tr><th>Зона</th><th>Продуктив.<br>(поле=100)</th><th>Площа,&nbsp;га</th><th>NDVI</th><th>NDRE</th><th>NDMI</th><th>Ґрунт&nbsp;волога</th></tr>{rows}</table>
+<div class="sub" style="margin-top:5px">Вегетація — дати: {meta['dates_veg']}<br>Голий ґрунт — дати: {meta['dates_soil']}</div>
 </body></html>"""
     hp = out_pdf.replace(".pdf", "_tmp.html")
     open(hp, "w", encoding="utf-8").write(html)
@@ -253,12 +305,31 @@ def main():
     core_mask = rasterize([(core, 1)], (H, W), transform=tr, fill=0, dtype="uint8").astype(bool)
     print(f"{FARM}/{FIELD_NAME}: {field.area/1e4:.1f} ha | grid {W}x{H} EPSG:{EPSG}")
 
-    comp, used, rgb = fetch_composites(bwgs, EPSG, tr, H, W)
-    ndvi = rz.clean_layer(comp["ndvi"], core_mask)
-    ndre = rz.clean_layer(comp["ndre"], core_mask)
-    ndmi = rz.clean_layer(comp["ndmi"], core_mask)
+    # ---- vegetation (peak) + BARE-SOIL (post-snowmelt) composites ----
+    ndvi_r, ndre_r, ndmi_r, used_veg = fetch_veg(bwgs, EPSG, tr, H, W)
+    soil_b_r, soil_m_r, used_soil = fetch_soil(bwgs, EPSG, tr, H, W)
+    ndvi = rz.clean_layer(ndvi_r, core_mask)
+    ndre = rz.clean_layer(ndre_r, core_mask)
+    ndmi = rz.clean_layer(ndmi_r, core_mask)
+    soil_b = rz.clean_layer(soil_b_r, core_mask) if soil_b_r is not None else None
+    soil_m = rz.clean_layer(soil_m_r, core_mask) if soil_m_r is not None else None
 
-    z, fulls = zonify(np.stack([ndvi, ndre, ndmi]), ndvi, core_mask, field_mask, field, tr, H, W)
+    # ---- DEM / relief (also a zoning feature) ----
+    dem_src = rz.download_cop30((bwgs[1] + bwgs[3]) / 2, (bwgs[0] + bwgs[2]) / 2)
+    demu, dtr, slope = rz.build_relief(dem_src, field, EPSG, bwgs)
+    demN = np.full((H, W), np.nan, "float32")
+    reproject(demu, demN, src_transform=dtr, src_crs=f"EPSG:{EPSG}", dst_transform=tr,
+              dst_crs=f"EPSG:{EPSG}", resampling=Resampling.bilinear)
+    elev = np.where(core_mask, demN, np.nan).astype("float32")
+
+    # ---- feature stack: vegetation + canopy moisture + SOIL + relief ----
+    feats, fnames = [ndvi, ndre, ndmi], ["NDVI", "NDRE", "NDMI"]
+    if soil_m is not None:
+        feats += [soil_m, soil_b]; fnames += ["soil-moisture", "soil-brightness"]
+    if USE_RELIEF_FEATURE:
+        feats.append(elev); fnames.append("relief")
+    print(f"  features: {', '.join(fnames)}")
+    z, fulls, k = zonify(feats, ndvi, core_mask, field_mask, field, tr, H, W)
     z.set_crs(EPSG, inplace=True)
     z = z.dissolve(by="zone_id", as_index=False)
     z = rz.clean_coverage(z, field, tol=max(4.0, rz.LEVELS[SMOOTH_LEVEL]["round_m"] * 0.5))
@@ -267,14 +338,7 @@ def main():
     z["zone_id"] = z["zone_id"].map({o: n for n, o in enumerate(uniq, 1)})
     z = z.sort_values("zone_id").reset_index(drop=True)
 
-    # DEM / relief
-    dem_src = rz.download_cop30((bwgs[1] + bwgs[3]) / 2, (bwgs[0] + bwgs[2]) / 2)
-    demu, dtr, slope = rz.build_relief(dem_src, field, EPSG, bwgs)
-    demN = np.full((H, W), np.nan, "float32")
-    reproject(demu, demN, src_transform=dtr, src_crs=f"EPSG:{EPSG}", dst_transform=tr,
-              dst_crs=f"EPSG:{EPSG}", resampling=Resampling.bilinear)
-
-    # attributes
+    # ---- attributes ----
     labf = rasterize([(g, i) for g, i in zip(z.geometry, z.zone_id)], (H, W), transform=tr, fill=0, dtype="int32")
     cm = core_mask & ~np.isnan(ndvi)
     fmean = float(np.nanmean(ndvi[cm]))
@@ -287,10 +351,11 @@ def main():
         rows.append(dict(zone_id=zid, product=round(float(np.nanmean(ndvi[pm])) / fmean * 100, 1),
                          ndvi=round(float(np.nanmean(ndvi[pm])), 3), ndre=round(float(np.nanmean(ndre[pm])), 3),
                          ndmi=round(float(np.nanmean(ndmi[pm])), 3),
+                         soil_m=round(float(np.nanmean(soil_m[pm])), 3) if soil_m is not None else None,
                          area_ha=round(float(r.geometry.area / 1e4), 2),
                          corr_elev=round(cr, 3) if cr == cr else None))
     z = z.merge(pd.DataFrame(rows), on="zone_id")
-    z = z[["zone_id", "product", "ndvi", "ndre", "ndmi", "area_ha", "corr_elev", "geometry"]]
+    z = z[["zone_id", "product", "ndvi", "ndre", "ndmi", "soil_m", "area_ha", "corr_elev", "geometry"]]
 
     # write zones (snap + gap-fill + verify)
     zpath = os.path.join(out, "zones.shp")
@@ -319,50 +384,44 @@ def main():
 
     # ---- report figures ----
     figdir = os.path.join(out, "_fig"); os.makedirs(figdir, exist_ok=True)
-    fmaskf = np.where(core_mask, 1.0, np.nan)
-    def savemap(arr, cmap, title, fn, pts=False):
+    def savemap(arr, cmap, title, fn):
         fig, ax = plt.subplots(figsize=(4, 4))
         ax.imshow(np.where(core_mask, arr, np.nan), cmap=cmap,
                   vmin=np.nanpercentile(arr[cm], 3), vmax=np.nanpercentile(arr[cm], 97))
         ax.set_title(title, fontsize=9); ax.axis("off")
         plt.tight_layout(); p = os.path.join(figdir, fn); plt.savefig(p, dpi=90, bbox_inches="tight"); plt.close()
         return p
-    p_ndvi = savemap(ndvi, "RdYlGn", "NDVI (вигор)", "ndvi.png")
-    p_ndre = savemap(ndre, "RdYlGn", "NDRE (черв. край)", "ndre.png")
-    p_ndmi = savemap(ndmi, "BrBG", "NDMI (волога)", "ndmi.png")
-    # relief hillshade
-    zz = np.where(np.isnan(demN), np.nanmean(demN), demN)
-    gy, gx = np.gradient(zz, GRID_M)
-    hs = np.cos(np.radians(45)) * np.cos(np.arctan(np.sqrt(gx**2 + gy**2))) + \
-         np.sin(np.radians(45)) * np.sin(np.arctan(np.sqrt(gx**2 + gy**2)))
+    figs = [(savemap(ndvi, "RdYlGn", "NDVI (вигор)", "ndvi.png"), "NDVI — вигор рослин"),
+            (savemap(ndre, "RdYlGn", "NDRE (черв. край)", "ndre.png"), "NDRE — червоний край"),
+            (savemap(ndmi, "BrBG", "NDMI (волога канопі)", "ndmi.png"), "NDMI — волога (посів)")]
+    if soil_m is not None:
+        figs.append((savemap(soil_m, "BrBG", "Ґрунт: волога (розталий)", "soil.png"),
+                     "Ґрунт — вологоємність (голий, весна)"))
     fig, ax = plt.subplots(figsize=(4, 4))
-    ax.imshow(np.where(core_mask, demN, np.nan), cmap="terrain"); ax.set_title("Рельєф (висота)", fontsize=9); ax.axis("off")
+    ax.imshow(np.where(core_mask, demN, np.nan), cmap="terrain")
+    ax.set_title("Рельєф (висота)", fontsize=9); ax.axis("off")
     plt.tight_layout(); p_dem = os.path.join(figdir, "dem.png"); plt.savefig(p_dem, dpi=90, bbox_inches="tight"); plt.close()
-    # zones
+    figs.append((p_dem, "Рельєф — Copernicus GLO-30"))
     fig, ax = plt.subplots(figsize=(4, 4))
-    zu = zo.to_crs(EPSG).sort_values("zone_id")
-    for _, r in zu.iterrows():
+    for _, r in zo.to_crs(EPSG).sort_values("zone_id").iterrows():
         gpd.GeoSeries([r.geometry], crs=EPSG).plot(ax=ax, color=COLORS[int(r.zone_id)-1], edgecolor="white", linewidth=0.7)
     ax.set_title("ЗОНИ (підсумок)", fontsize=9); ax.set_aspect("equal"); ax.axis("off")
     plt.tight_layout(); p_zon = os.path.join(figdir, "zones.png"); plt.savefig(p_zon, dpi=90, bbox_inches="tight"); plt.close()
-    # rgb
-    figs = [(p_ndvi, "NDVI — вигор рослин"), (p_ndre, "NDRE — червоний край"),
-            (p_ndmi, "NDMI — волога"), (p_dem, "Рельєф — Copernicus GLO-30")]
-    if rgb is not None:
-        fig, ax = plt.subplots(figsize=(4, 4)); ax.imshow(np.where(core_mask[..., None], rgb, np.nan))
-        ax.set_title("Знімок (true-color)", fontsize=9); ax.axis("off")
-        plt.tight_layout(); p_rgb = os.path.join(figdir, "rgb.png"); plt.savefig(p_rgb, dpi=90, bbox_inches="tight"); plt.close()
-        figs.append((p_rgb, "Sentinel-2 (натуральний колір)"))
     figs.append((p_zon, "Підсумкові зони продуктивності"))
 
+    soil_line = (f"Ґрунт (вологоємність): <b>{len(used_soil)} весняних безрослинних сцен</b> "
+                 f"({used_soil[0][:4]}–{used_soil[-1][:4]}) — яскравість + NSMI." if used_soil else
+                 "Ранньовесняних безрослинних сцен не знайдено — ґрунтовий шар не використано.")
     meta = dict(farm=FARM, field=FIELD_NAME, area_ha=round(field.area/1e4, 1), zones=len(zo),
-                date=max(used),
-                n_scenes=len(used), period=f"{used[0][:4]}–{used[-1][:4]}",
-                months=f"{MONTHS[0]}–{MONTHS[1]}", dates=", ".join(used),
+                n_veg=len(used_veg), period_veg=f"{used_veg[0][:4]}–{used_veg[-1][:4]}",
+                months_veg=f"{MONTHS[0]}–{MONTHS[1]}",
+                soil_line=soil_line, autok=k,
+                dates_veg=", ".join(used_veg),
+                dates_soil=(", ".join(used_soil) if used_soil else "—"),
                 zone_rows=z.drop(columns="geometry").sort_values("zone_id").to_dict("records"))
     build_pdf(figs, meta, os.path.join(out, "report.pdf"))
     import shutil; shutil.rmtree(figdir, ignore_errors=True)
-    print(f"  report.pdf + zones.shp + relief.shp -> {out}")
+    print(f"  report.pdf + zones.shp + relief.shp ({k} зон) -> {out}")
 
 
 if __name__ == "__main__":
