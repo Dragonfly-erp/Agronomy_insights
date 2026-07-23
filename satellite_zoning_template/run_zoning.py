@@ -47,7 +47,8 @@ from rasterio.warp import calculate_default_transform, reproject, Resampling
 from scipy import ndimage as ndi
 from scipy.stats import pearsonr
 from sklearn.cluster import KMeans
-from shapely.geometry import shape, Polygon, MultiPolygon, LineString
+from shapely.geometry import shape, Polygon, MultiPolygon, LineString, Point
+from shapely.prepared import prep
 from shapely.ops import unary_union
 import warnings
 warnings.filterwarnings("ignore")
@@ -63,8 +64,9 @@ SMOOTH_LEVEL  = "C"                # A(точно) B C(рекоменд.) D(си
 EDGE_BUFFER_M = 18.0               # стягування поля для аналізу (крайовий ефект), м
 GRID_M        = 5.0                # робоча сітка, м
 
-RELIEF_TYPE   = "contours"         # "contours" (горизонталі) або "elevation_zones"
-CONTOUR_STEP  = 1.0                # крок горизонталей, м
+RELIEF_TYPE   = "points"           # "points" (точки висот для Ag Leader/3D) · "contours" · "elevation_zones"
+POINT_STEP_M  = 20                 # крок сітки точок висот (для RELIEF_TYPE="points"), м
+CONTOUR_STEP  = 1.0                # крок горизонталей (для RELIEF_TYPE="contours"), м
 DEM_PATH      = None               # локальний DEM .tif; None -> авто Copernicus GLO-30
 
 OUT_CRS       = 4326               # CRS виходу (4326 = WGS84, універсально)
@@ -324,6 +326,7 @@ def main():
     # ---- per-zone attributes (from cleaned core pixels) ----
     labf = rasterize([(g, i) for g, i in zip(z.geometry, z.zone_id)], (H, W),
                      transform=tr, fill=0, dtype="int32")
+    fmean = float(clean[cm].mean())          # field-mean NDVI -> productivity base (=100)
     rows = []
     for _, row in z.sort_values("zone_id").iterrows():
         zid = int(row.zone_id)
@@ -336,6 +339,7 @@ def main():
         else:
             cr = float("nan")
         rows.append(dict(zone_id=zid,
+                         product=round(float(nd.mean()) / fmean * 100, 1),  # продуктивність, поле=100
                          veg_min=round(float(nd.min()), 4),
                          veg_max=round(float(nd.max()), 4),
                          veg_mean=round(float(nd.mean()), 4),
@@ -343,7 +347,8 @@ def main():
                          corr_elev=round(cr, 3) if cr == cr else None))
     attr = pd.DataFrame(rows)
     z = z.merge(attr, on="zone_id")
-    z = z[["zone_id", "veg_min", "veg_max", "veg_mean", "area_ha", "corr_elev", "geometry"]]
+    z = z[["zone_id", "product", "veg_min", "veg_max", "veg_mean",
+           "area_ha", "corr_elev", "geometry"]]
 
     # ---- reproject to OUT_CRS, SNAP coords so reprojection can't open slivers,
     #      then HARD integrity check on the EXACT geometry we are about to write ----
@@ -405,6 +410,28 @@ def build_relief(dem_src, field, EPSG, bbox_wgs):
 def write_relief(demu, dtr, slope, field, EPSG, out_dir):
     dh, dw = demu.shape
     zmin, zmax = np.nanmin(demu), np.nanmax(demu)
+    if RELIEF_TYPE == "points":
+        # точкова сітка висот -> для Ag Leader / 3D-поверхні (X, Y, elev_m, slope_pct)
+        step = max(1, int(round(POINT_STEP_M / 10.0)))     # DEM переведено на 10 м
+        pf = prep(field)
+        recs = []
+        for r in range(0, dh, step):
+            for c in range(0, dw, step):
+                e = demu[r, c]
+                if np.isnan(e):
+                    continue
+                x = dtr.c + (c + .5) * dtr.a
+                y = dtr.f + (r + .5) * dtr.e
+                pt = Point(x, y)
+                if not pf.contains(pt):
+                    continue
+                sp = slope[r, c]
+                recs.append({"elev_m": round(float(e), 2),
+                             "slope_pct": round(float(sp), 2) if not np.isnan(sp) else None,
+                             "geometry": pt})
+        gpd.GeoDataFrame(recs, crs=EPSG).to_crs(OUT_CRS).to_file(os.path.join(out_dir, "relief.shp"))
+        print(f"  relief.shp: {len(recs)} точок висот (крок {step*10} м), атрибути elev_m, slope_pct")
+        return
     if RELIEF_TYPE == "contours":
         import matplotlib
         matplotlib.use("Agg")
