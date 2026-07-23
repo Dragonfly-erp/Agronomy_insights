@@ -234,16 +234,52 @@ def write_qml_categorized(path, attr, cats):
         f'<categories>{catx}</categories><symbols>{syms}</symbols></renderer-v2></qgis>')
 
 
+def clean_layer(ndvi, core_mask):
+    """One NDVI grid -> cleaned core surface (MAD outliers, median de-stripe,
+    Gaussian). Returns float32 with NaN outside core."""
+    a = np.where(core_mask & ~np.isnan(ndvi), ndvi, np.nan)
+    v = a[~np.isnan(a)]
+    med = np.median(v); mad = np.median(np.abs(v - med)) or 1e-6
+    lo, hi = med - 3.5 * 1.4826 * mad, med + 3.5 * 1.4826 * mad
+    a = np.where((a < lo) | (a > hi), np.nan, a)
+    valid = ~np.isnan(a)
+    filled = nearest_fill(np.where(valid, a, med), valid)
+    c = ndi.gaussian_filter(ndi.median_filter(filled, size=5), sigma=2.0)
+    return np.where(core_mask, c, np.nan).astype("float32")
+
+
 # ------------------------------------------------------------------- pipeline
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     P = LEVELS[SMOOTH_LEVEL]
-    ndvi_gdf, EPSG = load_ndvi_to_utm(INPUT_NDVI, NDVI_FIELD)
-    field = field_from(FIELD_CONTOUR, ndvi_gdf, EPSG)
+    # INPUT_NDVI may be ONE path or a LIST of paths (multi-year -> stable zones)
+    inputs = list(INPUT_NDVI) if isinstance(INPUT_NDVI, (list, tuple)) else [INPUT_NDVI]
+    gdfs, EPSG = [], None
+    for pth in inputs:
+        g = gpd.read_file(pth)
+        if g.crs is None:
+            g = g.set_crs(4326)
+        g["geometry"] = g.geometry.buffer(0)          # repair invalid geometries
+        g = g[~g.geometry.is_empty & g.geometry.notna()]
+        if EPSG is None:
+            b = g.to_crs(4326).total_bounds
+            EPSG = utm_epsg((b[0] + b[2]) / 2, (b[1] + b[3]) / 2)
+        gdfs.append(g.to_crs(EPSG))
+
+    # field = contour if given, else union of ALL inputs' footprints (full field)
+    if FIELD_CONTOUR:
+        geom = shapely.union_all(gpd.read_file(FIELD_CONTOUR).to_crs(EPSG).geometry.values)
+    else:
+        geom = shapely.union_all([shapely.union_all(gg.geometry.values)
+                                  for gg in gdfs]).buffer(3).buffer(-3)
+    if geom.geom_type == "MultiPolygon":
+        geom = max(geom.geoms, key=lambda p: p.area)
+    field = Polygon(geom.exterior)
     core = field.buffer(-EDGE_BUFFER_M)
     if isinstance(core, MultiPolygon):
         core = max(core.geoms, key=lambda p: p.area)
-    print(f"CRS UTM EPSG:{EPSG} | field {field.area/1e4:.2f} ha | core {core.area/1e4:.2f} ha")
+    print(f"CRS UTM EPSG:{EPSG} | {len(inputs)} знімк(ів) | "
+          f"field {field.area/1e4:.2f} ha | core {core.area/1e4:.2f} ha")
 
     # grid over full field
     minx, miny, maxx, maxy = field.bounds
@@ -251,18 +287,19 @@ def main():
     tr = from_origin(minx, maxy, GRID_M, GRID_M)
     field_mask = rasterize([(field, 1)], (H, W), transform=tr, fill=0, dtype="uint8").astype(bool)
     core_mask = rasterize([(core, 1)], (H, W), transform=tr, fill=0, dtype="uint8").astype(bool)
-    ndvi = rasterize([(g, v) for g, v in zip(ndvi_gdf.geometry, ndvi_gdf[NDVI_FIELD])],
-                     (H, W), transform=tr, fill=np.nan, dtype="float32")
 
-    # ---- clean on core: MAD outliers -> median de-stripe -> gaussian ----
-    a = np.where(core_mask & ~np.isnan(ndvi), ndvi, np.nan)
-    v = a[~np.isnan(a)]; med = np.median(v); mad = np.median(np.abs(v - med)) or 1e-6
-    lo, hi = med - 3.5 * 1.4826 * mad, med + 3.5 * 1.4826 * mad
-    a = np.where((a < lo) | (a > hi), np.nan, a)
-    valid = ~np.isnan(a)
-    filled = nearest_fill(np.where(valid, a, med), valid)
-    clean = ndi.gaussian_filter(ndi.median_filter(filled, size=5), sigma=2.0)
-    clean = np.where(core_mask, clean, np.nan).astype("float32")
+    # clean each year, field-relative normalise, then COMBINE (stable pattern)
+    cleans = []
+    for gg in gdfs:
+        nd = rasterize([(geom, v) for geom, v in zip(gg.geometry, gg[NDVI_FIELD])],
+                       (H, W), transform=tr, fill=np.nan, dtype="float32")
+        cleans.append(clean_layer(nd, core_mask))
+    avg_ndvi = np.nanmean(np.stack(cleans), axis=0).astype("float32")   # реальний NDVI (сер. по роках)
+    rels = [c / np.nanmean(c) for c in cleans]                          # кожен рік -> поле = 1
+    combined = np.nanmean(np.stack(rels), axis=0).astype("float32")     # стабільний патерн продуктивності
+    combined = np.where(core_mask, combined, np.nan).astype("float32")
+    avg_ndvi = np.where(core_mask, avg_ndvi, np.nan).astype("float32")
+    clean = combined                                                    # кластеризуємо по стабільному патерну
 
     # ---- DEM / relief ----
     cwgs = gpd.GeoSeries([field], crs=EPSG).to_crs(4326)
@@ -318,6 +355,11 @@ def main():
     z = gpd.GeoDataFrame(recs, crs=EPSG).dissolve(by="zone_id", as_index=False)
     z = clean_coverage(z, field, tol=max(4.0, P["round_m"] * 0.5))
     z = z[z.geometry.area > 0]
+    # renumber to a CONTIGUOUS 1..K (a cluster may have been absorbed while
+    # compacting), preserving low->high productivity order
+    uniq = sorted(z["zone_id"].unique())
+    z["zone_id"] = z["zone_id"].map({o: n for n, o in enumerate(uniq, 1)})
+    z = z.sort_values("zone_id").reset_index(drop=True)
 
     hutm, outm, _ = coverage_holes_overlap(z)
     print(f"  coverage (UTM): gaps={hutm}  overlap={outm:.1f} m2  "
@@ -326,20 +368,21 @@ def main():
     # ---- per-zone attributes (from cleaned core pixels) ----
     labf = rasterize([(g, i) for g, i in zip(z.geometry, z.zone_id)], (H, W),
                      transform=tr, fill=0, dtype="int32")
-    fmean = float(clean[cm].mean())          # field-mean NDVI -> productivity base (=100)
+    fmean = float(combined[cm].mean())       # база продуктивності (стабільний патерн) -> =100
     rows = []
     for _, row in z.sort_values("zone_id").iterrows():
         zid = int(row.zone_id)
         pm = (labf == zid) & cm
-        nd = clean[pm]
+        cc = combined[pm]                    # стабільний індекс (для product)
+        nd = avg_ndvi[pm]                    # реальний NDVI, сер. по канопі-роках (для veg_*)
         el = demN[pm & ~np.isnan(demN)]
-        nde = clean[pm & ~np.isnan(demN)]
-        if len(nde) > 5 and np.std(el) > 0 and np.std(nde) > 0:
-            cr = float(pearsonr(nde, el)[0])
+        cce = combined[pm & ~np.isnan(demN)]
+        if len(cce) > 5 and np.std(el) > 0 and np.std(cce) > 0:
+            cr = float(pearsonr(cce, el)[0])
         else:
             cr = float("nan")
         rows.append(dict(zone_id=zid,
-                         product=round(float(nd.mean()) / fmean * 100, 1),  # продуктивність, поле=100
+                         product=round(float(cc.mean()) / fmean * 100, 1),  # продуктивність, поле=100
                          veg_min=round(float(nd.min()), 4),
                          veg_max=round(float(nd.max()), 4),
                          veg_mean=round(float(nd.mean()), 4),
@@ -358,6 +401,7 @@ def main():
     z_out = z_out[~z_out.geometry.is_empty]
     z_out = fill_coverage_gaps(z_out)                    # deterministic gap removal
     z_out["geometry"] = z_out.geometry.buffer(0)
+    z_out = fill_coverage_gaps(z_out)                    # 2nd pass after buffer(0)
 
     # write, then RE-READ and validate the ACTUAL file (I/O can reintroduce slivers)
     zone_path = os.path.join(OUT_DIR, "zones.shp")
