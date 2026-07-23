@@ -1,0 +1,11 @@
+{
+  "vr_index_pct": 93.3,
+  "anova_F": 112667.9,
+  "anova_p": 0.0,
+  "kruskal_H": 28815.8,
+  "kruskal_p": 0.0,
+  "n_samples": 15,
+  "ndvi_elev_spearman": -0.722,
+  "ndvi24_elev_spearman": 0.109,
+  "years_corr_pearson": 0.042
+}
