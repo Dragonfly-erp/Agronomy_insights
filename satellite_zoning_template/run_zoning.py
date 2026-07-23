@@ -39,6 +39,7 @@ import urllib.request
 import numpy as np
 import geopandas as gpd
 import pandas as pd
+import shapely
 import rasterio
 from rasterio.features import rasterize, shapes as rio_shapes
 from rasterio.transform import from_origin, Affine
@@ -154,6 +155,62 @@ def download_cop30(lat, lon, cache="dem_cache"):
     return out
 
 
+def coverage_holes_overlap(gdf):
+    """Integrity of a polygon coverage: (#gaps, overlap_m2, union).
+    gaps  = interior holes of the union (= white slivers between zones);
+    overlap = sum(parts) - union area (should be ~0)."""
+    u = shapely.union_all(gdf.geometry.values)
+    geoms = u.geoms if u.geom_type == "MultiPolygon" else [u]
+    holes = sum(len(list(p.interiors)) for p in geoms)
+    overlap = float(gdf.geometry.area.sum() - u.area)
+    return holes, overlap, u
+
+
+def clean_coverage(z, field, tol):
+    """Topology-preserving simplification of the zone coverage. Keeps shared
+    edges coincident (NO gaps/overlaps). Falls back to the unsimplified (still
+    gap-free) coverage if simplification would break integrity."""
+    base = z.copy()
+    try:
+        simp = shapely.coverage_simplify(z.geometry.values, tolerance=tol,
+                                         simplify_boundary=True)
+        cand = z.copy(); cand["geometry"] = simp
+        cand["geometry"] = cand.geometry.buffer(0)          # heal any float noise
+        h, ov, _ = coverage_holes_overlap(cand)
+        if h == 0 and abs(ov) < field.area * 1e-4:
+            return cand
+        print(f"  [warn] simplify(tol={tol}) -> gaps={h}; keeping unsimplified coverage")
+    except Exception as e:
+        print("  [warn] coverage_simplify unavailable:", e)
+    return base
+
+
+def fill_coverage_gaps(gdf):
+    """Deterministically remove ANY gaps (interior holes of the union) by merging
+    each gap into the neighbouring zone with the longest shared border. Works in
+    any CRS; guarantees a gap-free coverage regardless of upstream precision."""
+    from shapely.geometry import Polygon
+    geoms = list(gdf.geometry.values)
+    u = shapely.union_all(geoms)
+    polys = u.geoms if u.geom_type == "MultiPolygon" else [u]
+    filled = shapely.union_all([Polygon(p.exterior) for p in polys])
+    gaps = filled.difference(u)
+    if gaps.is_empty:
+        return gdf
+    gp_list = gaps.geoms if gaps.geom_type in ("MultiPolygon", "GeometryCollection") else [gaps]
+    for gp in gp_list:
+        if getattr(gp, "area", 0) <= 0:
+            continue
+        best, blen = 0, -1.0
+        for i, zg in enumerate(geoms):
+            shared = zg.boundary.intersection(gp.boundary).length
+            if shared > blen:
+                blen, best = shared, i
+        geoms[best] = shapely.union_all([geoms[best], gp])
+    out = gdf.copy(); out["geometry"] = geoms
+    return out
+
+
 def hex2rgb(h):
     h = h.lstrip("#"); return f"{int(h[0:2],16)},{int(h[2:4],16)},{int(h[4:6],16)},255"
 
@@ -251,11 +308,18 @@ def main():
         fulls = sieve(fulls, field_mask, int(0.3 * 1e4 / GRID_M ** 2))
     else:
         fulls = full
+    # rasterio shapes tile exactly (shared pixel edges) -> gap-free coverage.
+    # Simplify the WHOLE coverage at once (NOT per polygon) so shared edges stay
+    # coincident. Per-polygon .simplify() would open slivers between zones.
     recs = [{"zone_id": int(val), "geometry": shape(g)}
             for g, val in rio_shapes(fulls, mask=field_mask, transform=tr) if int(val)]
     z = gpd.GeoDataFrame(recs, crs=EPSG).dissolve(by="zone_id", as_index=False)
-    z["geometry"] = z.geometry.simplify(4)
+    z = clean_coverage(z, field, tol=max(4.0, P["round_m"] * 0.5))
     z = z[z.geometry.area > 0]
+
+    hutm, outm, _ = coverage_holes_overlap(z)
+    print(f"  coverage (UTM): gaps={hutm}  overlap={outm:.1f} m2  "
+          f"= {z.geometry.area.sum()/1e4:.2f}/{field.area/1e4:.2f} ha")
 
     # ---- per-zone attributes (from cleaned core pixels) ----
     labf = rasterize([(g, i) for g, i in zip(z.geometry, z.zone_id)], (H, W),
@@ -281,9 +345,28 @@ def main():
     z = z.merge(attr, on="zone_id")
     z = z[["zone_id", "veg_min", "veg_max", "veg_mean", "area_ha", "corr_elev", "geometry"]]
 
-    # ---- write zones.shp ----
+    # ---- reproject to OUT_CRS, SNAP coords so reprojection can't open slivers,
+    #      then HARD integrity check on the EXACT geometry we are about to write ----
+    z_out = z.to_crs(OUT_CRS)
+    grid = 1e-7 if z_out.crs.is_geographic else 0.01     # ~1 cm snap
+    z_out["geometry"] = shapely.set_precision(z_out.geometry.values, grid_size=grid)
+    z_out = z_out[~z_out.geometry.is_empty]
+    z_out = fill_coverage_gaps(z_out)                    # deterministic gap removal
+    z_out["geometry"] = z_out.geometry.buffer(0)
+
+    # write, then RE-READ and validate the ACTUAL file (I/O can reintroduce slivers)
     zone_path = os.path.join(OUT_DIR, "zones.shp")
-    z.to_crs(OUT_CRS).to_file(zone_path)
+    z_out.to_file(zone_path)
+    check = gpd.read_file(zone_path)
+    holes, overlap, _ = coverage_holes_overlap(check)
+    if holes > 0:                                        # last-resort heal + rewrite
+        fill_coverage_gaps(check).to_file(zone_path)
+        check = gpd.read_file(zone_path)
+        holes, overlap, _ = coverage_holes_overlap(check)
+    print(f"  INTEGRITY (written file, {OUT_CRS}): gaps(holes)={holes}  overlap≈{overlap:.2e}")
+    if holes > 0:
+        raise SystemExit(f"!! ЦІЛІСНІСТЬ ПОРУШЕНА: {holes} щілин у покритті — файл НЕ збережено.")
+    z = z_out
     if WRITE_QML:
         write_qml_categorized(os.path.join(OUT_DIR, "zones.qml"), "zone_id",
                               [(int(rr.zone_id), f"Зона {int(rr.zone_id)} (NDVI {rr.veg_mean})",
